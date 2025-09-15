@@ -4,8 +4,9 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Arduino_GFX_Library.h>
-#include <esp_now.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <esp_wifi.h>
 #include "pin_config.h"
 
 // Power latch
@@ -33,8 +34,12 @@
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, true, LCD_WIDTH, LCD_HEIGHT, 0, 20, 0, 0);
 
-// ESP-NOW
-uint8_t esp8266Mac[] = {0xE8, 0xDB, 0x84, 0xDC, 0x4C, 0x2A}; // THAY BẰNG MAC THỰC TẾ của ESP8266
+// Wi‑Fi STA + UDP broadcast config
+static const char *STA_SSID = "Van Bach 1";      // TODO: set
+static const char *STA_PASS = "0909989547";  // TODO: set
+static const uint16_t UDP_PORT = 4210;
+static const IPAddress BROADCAST_IP(255, 255, 255, 255);
+WiFiUDP Udp;
 
 // State Variables
 BLEServer* pServer = nullptr;
@@ -46,18 +51,20 @@ String roadName = "";
 unsigned long lastBlinkTime = 0;
 bool blinkState = true;
 unsigned long lastMotorLog = 0;
+bool advertisePending = false;
+unsigned long advertiseAtMs = 0;
+// AP fallback state
+bool apOpenFallbackDone = false;
+unsigned long apStartedMs = 0;
+// AP settings
+int apChannel = 1;
+bool apHidden = false;
 
 // Function Declarations
 void displayNavigation();
-void sendEspNowData();
 String removeVietnameseDiacritics(String str);
 
-// ESP-NOW Callback
-void onEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.printf("[ESP-NOW] Sent to %02X:%02X:%02X:%02X:%02X:%02X, Status: %s\n",
-                mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-                status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
-}
+// (Using BLE from phone -> ESP32, then UDP broadcast over existing Wi‑Fi)
 
 // Remove Vietnamese Diacritics
 String removeVietnameseDiacritics(String str) {
@@ -297,21 +304,13 @@ void displayNavigation() {
   gfx->println(dispDir != "" ? rn : "");
 }
 
-// Send ESP-NOW Data
-void sendEspNowData() {
-  String mqttDir = currentDirection;  // Không map SLIGHT_RIGHT để debug dễ hơn
-  String payload = mqttDir + "," + currentDistance + "," + roadName;
-  payload.trim();
-  Serial.print("[ESP-NOW] Sending to MAC: ");
-  for (int i = 0; i < 6; i++) {
-    Serial.print(esp8266Mac[i], HEX);
-    if (i < 5) Serial.print(":");
-  }
-  Serial.println();
-  Serial.print("[ESP-NOW] Payload: ");
-  Serial.println(payload);
-  esp_err_t result = esp_now_send(esp8266Mac, (uint8_t *)payload.c_str(), payload.length());
-  Serial.printf("[ESP-NOW] Send '%s' => %s\n", payload.c_str(), result == ESP_OK ? "OK" : "FAIL");
+// Helper to send to ESP8266 via UDP
+void sendUdpMessage(const String &message) {
+  Serial.print("[UDP] TX: ");
+  Serial.println(message);
+  Udp.beginPacket(BROADCAST_IP, UDP_PORT);
+  Udp.print(message);
+  Udp.endPacket();
 }
 
 // BLE Callbacks
@@ -319,6 +318,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     deviceConnected = true;
     Serial.println("[BLE] Connected");
+    // When connected, advertising is stopped by the stack; keep it minimal.
     displayNavigation();
   }
   void onDisconnect(BLEServer* s) override {
@@ -328,7 +328,9 @@ class MyServerCallbacks : public BLEServerCallbacks {
     roadName = "";
     digitalWrite(VIBRATION_PIN, LOW);
     Serial.println("[BLE] Disconnected");
-    BLEDevice::startAdvertising();
+    // Delay re-advertising a bit to avoid immediate RF contention
+    advertisePending = true;
+    advertiseAtMs = millis() + 200; // 100–300 ms
     displayNavigation();
   }
 };
@@ -369,8 +371,11 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
       digitalWrite(VIBRATION_PIN, LOW);
     }
 
-    if (currentDirection == "RIGHT" || currentDirection == "SLIGHT_RIGHT") {
-      sendEspNowData();
+    // Send message to ESP8266 over UDP
+    {
+      String payload = currentDirection + "," + currentDistance + "," + roadName;
+      payload.trim();
+      sendUdpMessage(payload);
     }
 
     displayNavigation();
@@ -379,15 +384,74 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
 
 // Setup
 void setup() {
-  pinMode(SYS_EN_PIN, OUTPUT);
-  digitalWrite(SYS_EN_PIN, HIGH);
 
   Serial.begin(115200);
   delay(200);
+
+  // Start SoftAP
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+  // First, set country to allow channels 1-13 (many routers use 12/13)
+  wifi_country_t cJP = {"JP", 1, 13, WIFI_COUNTRY_POLICY_MANUAL};
+  esp_wifi_set_country(&cJP);
+
+  // Optional scan to verify SSID and channel
+  Serial.printf("[STA] Scanning for '%s'...\n", STA_SSID);
+  int n = WiFi.scanNetworks();
+  int foundIdx = -1; int foundCh = 0; int foundRssi = -127;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == String(STA_SSID)) { foundIdx = i; foundCh = WiFi.channel(i); foundRssi = WiFi.RSSI(i); }
+  }
+  if (foundIdx >= 0) {
+    Serial.printf("[STA] Found SSID '%s' CH=%d RSSI=%d dBm\n", STA_SSID, foundCh, foundRssi);
+  } else {
+    Serial.println("[STA] Target SSID not found in scan (will attempt anyway)");
+  }
+
+  Serial.printf("[STA] Connecting to %s\n", STA_SSID);
+  WiFi.begin(STA_SSID, STA_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() != WL_CONNECTED) {
+    // Retry once with country US (1-11) if router is restricted
+    wifi_country_t cUS = {"US", 1, 11, WIFI_COUNTRY_POLICY_MANUAL};
+    esp_wifi_set_country(&cUS);
+    Serial.println("[STA] First attempt failed; retry with US country (1-11)");
+    WiFi.disconnect();
+    delay(300);
+    WiFi.begin(STA_SSID, STA_PASS);
+    t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+      delay(250);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[STA] Connected. IP=%s GW=%s\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
+  } else {
+    Serial.println("[STA] Connect failed; will continue and retry later");
+  }
+  Udp.begin(UDP_PORT);
+  Serial.printf("[UDP] Sender ready on %s:%u\n", WiFi.localIP().toString().c_str(), UDP_PORT);
+
+  pinMode(SYS_EN_PIN, OUTPUT);
+  digitalWrite(SYS_EN_PIN, HIGH);
+
+
   Serial.println("=== ESP32 Navigation (Left) ===");
   Serial.println("Note: vibration motor needs transistor/NPN if >20mA (GPIO18)");
-  Serial.print("ESP32 MAC: ");
-  Serial.println(WiFi.macAddress()); // Thêm để lấy MAC thực tế
+  Serial.println("ESP32 ready (STA + UDP broadcast)");
 
   pinMode(VIBRATION_PIN, OUTPUT);
   digitalWrite(VIBRATION_PIN, LOW);
@@ -397,15 +461,15 @@ void setup() {
   delay(500);
   digitalWrite(VIBRATION_PIN, LOW);
 
-  // LCD backlight
+  // LCD init first (no RF touched yet)
   pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, HIGH);
-
   if (!gfx->begin(40000000)) {
     Serial.println("[LCD] begin() failed!");
     while (true) delay(1000);
   }
   gfx->displayOn();
+  // Turn on backlight after successful begin
+  digitalWrite(LCD_BL, HIGH);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   gfx->fillScreen(DARK_BG);
   drawGradientRect(0, 0, LCD_WIDTH, LCD_HEIGHT, GRADIENT_TOP, GRADIENT_BOT);
@@ -415,24 +479,7 @@ void setup() {
   gfx->println("ESP32 Navigation");
   delay(800);
 
-  // ESP-NOW init
-  WiFi.mode(WIFI_STA);
-  Serial.print("WiFi Channel: ");
-  Serial.println(WiFi.channel());
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("[ESP-NOW] Initialization failed");
-    while (true) delay(1000);
-  }
-  esp_now_register_send_cb(onEspNowSent);
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, esp8266Mac, 6);
-  peerInfo.channel = 1; // Sửa: Dùng channel 1
-  peerInfo.encrypt = false;
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("[ESP-NOW] Failed to add peer - Check MAC address!");
-    while (true) delay(1000);
-  }
-  Serial.println("[ESP-NOW] Peer added successfully");
+  // ESP-NOW and Wi-Fi removed. Using UART for inter-device communication.
 
   // BLE init
   BLEDevice::init("ESP32_Navigation");
@@ -450,8 +497,9 @@ void setup() {
 
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SERVICE_UUID);
-  adv->setScanResponse(true);
-  adv->setMinPreferred(0x06);
+  // Reduce background BLE load
+  adv->setScanResponse(false);
+  adv->setMinPreferred(0x00);
   BLEDevice::startAdvertising();
 
   displayNavigation();
@@ -472,6 +520,14 @@ void loop() {
     bool on = digitalRead(VIBRATION_PIN);
     Serial.printf("[MOTOR] %s | Dir=%s (BLE:%d)\n", on ? "ON" : "OFF", currentDirection.c_str(), deviceConnected);
   }
+
+  // Handle delayed BLE re-advertising after disconnect
+  if (!deviceConnected && advertisePending && millis() >= advertiseAtMs) {
+    BLEDevice::startAdvertising();
+    advertisePending = false;
+  }
+
+  // No AP fallback in STA mode
 
   delay(10);
 }
