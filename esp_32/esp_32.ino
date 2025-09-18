@@ -4,9 +4,9 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Arduino_GFX_Library.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <esp_wifi.h>
+#include "ESP32_NOW.h"
+#include "WiFi.h"
+#include <esp_mac.h>
 #include "pin_config.h"
 
 // Power latch
@@ -34,12 +34,38 @@
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, true, LCD_WIDTH, LCD_HEIGHT, 0, 20, 0, 0);
 
-// Wi‑Fi STA + UDP broadcast config
-static const char *STA_SSID = "Van Bach 1";      // TODO: set
-static const char *STA_PASS = "0909989547";  // TODO: set
-static const uint16_t UDP_PORT = 4210;
-static const IPAddress BROADCAST_IP(255, 255, 255, 255);
-WiFiUDP Udp;
+// ESP-NOW Configuration
+#define ESPNOW_WIFI_CHANNEL 6
+
+// ESP-NOW Broadcast Peer Class
+class ESP_NOW_Broadcast_Peer : public ESP_NOW_Peer {
+public:
+  // Constructor of the class using the broadcast address
+  ESP_NOW_Broadcast_Peer(uint8_t channel, wifi_interface_t iface, const uint8_t *lmk) : ESP_NOW_Peer(ESP_NOW.BROADCAST_ADDR, channel, iface, lmk) {}
+
+  // Destructor of the class
+  ~ESP_NOW_Broadcast_Peer() {
+    remove();
+  }
+
+  // Function to properly initialize the ESP-NOW and register the broadcast peer
+  bool begin() {
+    if (!ESP_NOW.begin() || !add()) {
+      log_e("Failed to initialize ESP-NOW or register the broadcast peer");
+      return false;
+    }
+    return true;
+  }
+
+  // Function to send a message to all devices within the network
+  bool send_message(const uint8_t *data, size_t len) {
+    if (!send(data, len)) {
+      log_e("Failed to broadcast message");
+      return false;
+    }
+    return true;
+  }
+};
 
 // State Variables
 BLEServer* pServer = nullptr;
@@ -53,16 +79,22 @@ bool blinkState = true;
 unsigned long lastMotorLog = 0;
 bool advertisePending = false;
 unsigned long advertiseAtMs = 0;
-// AP fallback state
-bool apOpenFallbackDone = false;
-unsigned long apStartedMs = 0;
-// AP settings
-int apChannel = 1;
-bool apHidden = false;
+
+// Acknowledgment tracking
+unsigned long lastMessageId = 0;
+unsigned long lastMessageTime = 0;
+bool waitingForAck = false;
+int ackRetryCount = 0;
+const int MAX_ACK_RETRIES = 3;
+
+// ESP-NOW Global Variables
+ESP_NOW_Broadcast_Peer* broadcast_peer = nullptr;
 
 // Function Declarations
 void displayNavigation();
 String removeVietnameseDiacritics(String str);
+void cleanupEspNow();
+void handleAcknowledgment(const uint8_t *data, size_t len);
 
 // (Using BLE from phone -> ESP32, then UDP broadcast over existing Wi‑Fi)
 
@@ -118,6 +150,34 @@ String removeVietnameseDiacritics(String str) {
     }
   }
   return out;
+}
+
+// Cleanup ESP-NOW resources
+void cleanupEspNow() {
+  if (broadcast_peer) {
+    delete broadcast_peer;
+    broadcast_peer = nullptr;
+    Serial.println("[ESP-NOW] Cleanup completed");
+  }
+}
+
+// Handle acknowledgment from slave devices
+void handleAcknowledgment(const uint8_t *data, size_t len) {
+  String ackMessage = String((char*)data);
+  Serial.printf("[ESP-NOW] ACK received: %s\n", ackMessage.c_str());
+  
+  // Parse acknowledgment message (format: "ACK|messageId")
+  int pipeIndex = ackMessage.indexOf('|');
+  if (pipeIndex != -1) {
+    String ackType = ackMessage.substring(0, pipeIndex);
+    unsigned long ackMessageId = ackMessage.substring(pipeIndex + 1).toInt();
+    
+    if (ackType == "ACK" && ackMessageId == lastMessageId) {
+      waitingForAck = false;
+      ackRetryCount = 0;
+      Serial.printf("[ESP-NOW] Message %lu acknowledged successfully\n", lastMessageId);
+    }
+  }
 }
 
 // Draw UI
@@ -304,13 +364,49 @@ void displayNavigation() {
   gfx->println(dispDir != "" ? rn : "");
 }
 
-// Helper to send to ESP8266 via UDP
-void sendUdpMessage(const String &message) {
-  Serial.print("[UDP] TX: ");
+// Helper to send navigation data via ESP-NOW with proper encoding and acknowledgment
+void sendEspNowMessage(const String &message) {
+  if (!broadcast_peer) {
+    Serial.println("[ESP-NOW] Broadcast peer not initialized");
+    return;
+  }
+  
+  Serial.print("[ESP-NOW] TX: ");
   Serial.println(message);
-  Udp.beginPacket(BROADCAST_IP, UDP_PORT);
-  Udp.print(message);
-  Udp.endPacket();
+  
+  // Generate unique message ID
+  lastMessageId = millis();
+  lastMessageTime = lastMessageId;
+  
+  // Add message ID and timestamp for better tracking
+  String enhancedMessage = String(lastMessageId) + "|" + message;
+  
+  // Calculate exact length without null terminator for ESP-NOW
+  size_t enhancedLen = enhancedMessage.length();
+  if (enhancedLen > 250) { // ESP-NOW max payload is ~250 bytes
+    Serial.println("[ESP-NOW] Message too long, truncating");
+    enhancedLen = 250;
+  }
+  
+  // Create buffer with exact size (no extra null terminator)
+  uint8_t enhancedData[enhancedLen];
+  memcpy(enhancedData, enhancedMessage.c_str(), enhancedLen);
+  
+  // Debug: Print the actual data being sent
+  Serial.printf("[DEBUG] Sending: '%s' (len: %zu)\n", enhancedMessage.c_str(), enhancedLen);
+  Serial.printf("[DEBUG] Buffer content: ");
+  for (size_t i = 0; i < enhancedLen; i++) {
+    Serial.printf("%c", enhancedData[i]);
+  }
+  Serial.println();
+  
+  if (!broadcast_peer->send_message(enhancedData, enhancedLen)) {
+    Serial.println("[ESP-NOW] Failed to broadcast message");
+    ackRetryCount++;
+  } else {
+    waitingForAck = true;
+    Serial.printf("[ESP-NOW] Message sent successfully (ID: %lu, Len: %zu, Waiting for ACK)\n", lastMessageId, enhancedLen);
+  }
 }
 
 // BLE Callbacks
@@ -318,7 +414,6 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     deviceConnected = true;
     Serial.println("[BLE] Connected");
-    // When connected, advertising is stopped by the stack; keep it minimal.
     displayNavigation();
   }
   void onDisconnect(BLEServer* s) override {
@@ -371,11 +466,11 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
       digitalWrite(VIBRATION_PIN, LOW);
     }
 
-    // Send message to ESP8266 over UDP
+    // Send message via ESP-NOW (only direction)
     {
-      String payload = currentDirection + "," + currentDistance + "," + roadName;
+      String payload = currentDirection;
       payload.trim();
-      sendUdpMessage(payload);
+      sendEspNowMessage(payload);
     }
 
     displayNavigation();
@@ -388,62 +483,32 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Start SoftAP
+  // Initialize ESP-NOW
   WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
-
-  // First, set country to allow channels 1-13 (many routers use 12/13)
-  wifi_country_t cJP = {"JP", 1, 13, WIFI_COUNTRY_POLICY_MANUAL};
-  esp_wifi_set_country(&cJP);
-
-  // Optional scan to verify SSID and channel
-  Serial.printf("[STA] Scanning for '%s'...\n", STA_SSID);
-  int n = WiFi.scanNetworks();
-  int foundIdx = -1; int foundCh = 0; int foundRssi = -127;
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == String(STA_SSID)) { foundIdx = i; foundCh = WiFi.channel(i); foundRssi = WiFi.RSSI(i); }
-  }
-  if (foundIdx >= 0) {
-    Serial.printf("[STA] Found SSID '%s' CH=%d RSSI=%d dBm\n", STA_SSID, foundCh, foundRssi);
-  } else {
-    Serial.println("[STA] Target SSID not found in scan (will attempt anyway)");
+  WiFi.setChannel(ESPNOW_WIFI_CHANNEL);
+  while (!WiFi.STA.started()) {
+    delay(100);
   }
 
-  Serial.printf("[STA] Connecting to %s\n", STA_SSID);
-  WiFi.begin(STA_SSID, STA_PASS);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-    delay(250);
-    Serial.print(".");
+  Serial.println("ESP-NOW Navigation Device");
+  Serial.println("Wi-Fi parameters:");
+  Serial.println("  Mode: STA");
+  Serial.println("  MAC Address: " + WiFi.macAddress());
+  Serial.printf("  Channel: %d\n", ESPNOW_WIFI_CHANNEL);
+
+  // Initialize and register the broadcast peer
+  broadcast_peer = new ESP_NOW_Broadcast_Peer(ESPNOW_WIFI_CHANNEL, WIFI_IF_STA, nullptr);
+  if (!broadcast_peer->begin()) {
+    Serial.println("Failed to initialize ESP-NOW broadcast peer");
+    delete broadcast_peer;
+    broadcast_peer = nullptr;
+    Serial.println("Rebooting in 5 seconds...");
+    delay(5000);
+    ESP.restart();
   }
-  Serial.println();
-  if (WiFi.status() != WL_CONNECTED) {
-    // Retry once with country US (1-11) if router is restricted
-    wifi_country_t cUS = {"US", 1, 11, WIFI_COUNTRY_POLICY_MANUAL};
-    esp_wifi_set_country(&cUS);
-    Serial.println("[STA] First attempt failed; retry with US country (1-11)");
-    WiFi.disconnect();
-    delay(300);
-    WiFi.begin(STA_SSID, STA_PASS);
-    t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-      delay(250);
-      Serial.print(".");
-    }
-    Serial.println();
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[STA] Connected. IP=%s GW=%s\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
-  } else {
-    Serial.println("[STA] Connect failed; will continue and retry later");
-  }
-  Udp.begin(UDP_PORT);
-  Serial.printf("[UDP] Sender ready on %s:%u\n", WiFi.localIP().toString().c_str(), UDP_PORT);
+
+  Serial.printf("ESP-NOW version: %d, max data length: %d\n", ESP_NOW.getVersion(), ESP_NOW.getMaxDataLen());
+  Serial.println("ESP-NOW broadcast ready");
 
   pinMode(SYS_EN_PIN, OUTPUT);
   digitalWrite(SYS_EN_PIN, HIGH);
@@ -451,7 +516,7 @@ void setup() {
 
   Serial.println("=== ESP32 Navigation (Left) ===");
   Serial.println("Note: vibration motor needs transistor/NPN if >20mA (GPIO18)");
-  Serial.println("ESP32 ready (STA + UDP broadcast)");
+  Serial.println("ESP32 ready (BLE + ESP-NOW broadcast)");
 
   pinMode(VIBRATION_PIN, OUTPUT);
   digitalWrite(VIBRATION_PIN, LOW);
@@ -479,7 +544,7 @@ void setup() {
   gfx->println("ESP32 Navigation");
   delay(800);
 
-  // ESP-NOW and Wi-Fi removed. Using UART for inter-device communication.
+  // ESP-NOW initialized for inter-device communication.
 
   // BLE init
   BLEDevice::init("ESP32_Navigation");
@@ -497,9 +562,9 @@ void setup() {
 
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SERVICE_UUID);
-  // Reduce background BLE load
-  adv->setScanResponse(false);
-  adv->setMinPreferred(0x00);
+  // Match older behavior: enable scan response and set min preferred
+  adv->setScanResponse(true);
+  adv->setMinPreferred(0x06);
   BLEDevice::startAdvertising();
 
   displayNavigation();
@@ -527,7 +592,22 @@ void loop() {
     advertisePending = false;
   }
 
-  // No AP fallback in STA mode
+  // Handle ESP-NOW acknowledgment timeout and retry
+  if (waitingForAck && (millis() - lastMessageTime > 2000)) { // 2 second timeout
+    if (ackRetryCount < MAX_ACK_RETRIES) {
+      Serial.printf("[ESP-NOW] ACK timeout, retrying message %lu (attempt %d/%d)\n", 
+                    lastMessageId, ackRetryCount + 1, MAX_ACK_RETRIES);
+      
+      // Resend the last message (only direction)
+      String lastMessage = currentDirection;
+      lastMessage.trim();
+      sendEspNowMessage(lastMessage);
+    } else {
+      Serial.printf("[ESP-NOW] Max retries reached for message %lu, giving up\n", lastMessageId);
+      waitingForAck = false;
+      ackRetryCount = 0;
+    }
+  }
 
   delay(10);
 }
